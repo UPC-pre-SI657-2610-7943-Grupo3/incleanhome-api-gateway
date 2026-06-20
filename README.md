@@ -1,79 +1,75 @@
 # InCleanHome API Gateway
-> Single entry point for the InCleanHome microservices platform.
 
-Built on **YARP** (Yet Another Reverse Proxy) running on **.NET 9**. This service:
+> Single entry point for the InCleanHome microservices, built on YARP.
 
-- Routes incoming HTTP requests to the right microservice based on URL path.
-- Validates JWT tokens once at the edge so internal services can trust the headers.
-- Applies CORS so the Vue frontend can reach the system from a different origin.
-- Reads its configuration (routes, clusters, JWT settings) from **Consul KV** at startup.
-- Optionally registers itself in Consul for service discovery.
+This service is the only one exposed to the public internet (or in local dev, the
+only one the frontend talks to directly). It:
 
-This service is part of the larger [InCleanHome platform](https://github.com/UPC-pre-SI657-2610-7943-Grupo3/incleanhome-platform).
+- Validates JWT tokens at the edge (defense at the perimeter; each microservice
+  also validates again — defense in depth).
+- Routes incoming HTTP requests to the right microservice based on path prefix.
+- Reads its routing table from **Consul KV** at startup, with the local
+  `appsettings.json` as fallback.
+- Registers itself in Consul Service Discovery so other tools can find it.
 
-## Architecture in one paragraph
-The gateway boots, asks Consul for `config/api-gateway` (a JSON blob), feeds that into
-ASP.NET's `IConfiguration`, and YARP picks up the routing tables from there. JWT settings
-come from the same blob; the signing key is read from an environment variable (it is a
-secret and does not belong in Consul). If Consul is unreachable at startup, the gateway
-falls back to the local `appsettings.json` so it can still come up. After it's running,
-an opt-in hosted service registers it in Consul service catalog with a health check.
+## Routes
+
+All routes are versioned under `/api/v1/`. The gateway is at `http://localhost:8080`
+in local dev.
+
+| Path prefix | Forwards to | Service |
+|---|---|---|
+| `/api/v1/auth/**` | iam-service:5001 | IAM (login, register, /me, Auth0) |
+| `/api/v1/admin/**` | iam-service:5001 | IAM admin endpoints |
+| `/api/v1/iam/**` | iam-service:5001 (prefix stripped) | IAM (alternative path) |
+| `/api/v1/profiles/**` | profile-service:5002 | Profile (me, clients, workers, photos) |
+| `/api/v1/clients/**` | profile-service:5002 | Client public profile lookups |
+| `/api/v1/workers/**` | profile-service:5002 | Worker public profile lookups |
+| `/api/v1/bookings/**` | booking-service:5003 | Booking requests |
+| `/api/v1/service-payments/**` | payment-service:5004 | Payment for a booking |
+| `/api/v1/payment-methods/**` | payment-service:5004 | Saved payment methods |
+| `/api/v1/mercadopago/**` | payment-service:5004 | MercadoPago webhooks + checkout |
+| `/api/v1/messages/**` | communication-service:5005 | Twilio chat messages |
+| `/api/v1/conversations/**` | communication-service:5005 | Chat conversations |
+| `/api/v1/twilio/**` | communication-service:5005 | Twilio access tokens / webhooks |
+| `/api/v1/notifications/**` | communication-service:5005 | In-app + FCM push notifications |
+| `/api/v1/reviews/**` | reviews-service:5006 | Service reviews |
+| `/api/v1/reports/**` | reviews-service:5006 | User reports |
+| `/api/v1/suspension-appeals/**` | reviews-service:5006 | Suspension appeals |
+| `/api/v1/availability/**` | search-service:5007 | Worker availability slots |
+| `/api/v1/catalog/**` | search-service:5007 | Worker discovery / catalog |
+
+## Run it (with the rest of the platform)
+
+```bash
+cd ../incleanhome-platform
+./scripts/start.sh
+```
+
+The gateway listens on port `8080`.
+
+## Environment variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `JWT_SIGNING_KEY` | **YES** | HMAC-SHA256 key, same as IAM Service issues with |
+| `CONSUL_HTTP_ADDR` | no | Default: `http://consul:8500` |
+| `CONSUL_DISCOVERY_ENABLED` | no | Default: `true` |
+| `SERVICE_NAME` | no | Default: `api-gateway` |
 
 ## Folder layout
 
 ```
-incleanhome-api-gateway/
-├── InCleanHome.ApiGateway.sln
-├── Dockerfile
-└── src/InCleanHome.ApiGateway/
-    ├── InCleanHome.ApiGateway.csproj
-    ├── Program.cs
-    ├── appsettings.json                       # fallback config only
-    ├── appsettings.Development.json
-    ├── Configuration/
-    │   └── ConsulConfigurationLoader.cs       # GETs config/api-gateway from KV
-    └── Discovery/
-        ├── ConsulServiceRegistration.cs       # HTTP client for register/deregister
-        └── ConsulRegistrationHostedService.cs # lifecycle hook
+src/InCleanHome.ApiGateway/
+├── Program.cs                       # composition root
+├── appsettings.json                 # FALLBACK config (real one is in Consul)
+├── Configuration/
+│   └── ConsulConfigurationLoader.cs # downloads config/api-gateway from KV at startup
+└── Discovery/
+    ├── ConsulServiceRegistration.cs # registers/deregisters this gateway
+    └── ConsulRegistrationHostedService.cs
 ```
 
-The gateway will be available at <http://localhost:8080>.
-
-## Routes currently configured
-| External path (what Vue calls) | Routed to | Notes |
-|---|---|---|
-| `/api/v1/auth/**` | `iam-service:5001` | Login, register, refresh |
-| `/api/v1/iam/**` | `iam-service:5001` | Admin operations (prefix is stripped) |
-| `/api/v1/profiles/**` | `profile-service:5002` | Profile CRUD |
-
-When new microservices are added, their routes go into `api-gateway.json`
-in the platform repo, not into this code.
-
-## Endpoints owned by the gateway itself
-| Path | Purpose |
-|---|---|
-| `/` | Quick status (service name, config source, version) |
-| `/health` | Health check for Docker and Consul probes |
-
-
-## How it cooperates with other repos
-| Repo | Relationship |
-|---|---|
-| `incleanhome-platform` | Owns the docker-compose, env vars, Consul JSON for this gateway |
-| `incleanhome-iam-service` | Target of `/api/v1/iam` and `/api/v1/auth` routes |
-| `incleanhome-profile-service` | Target of `/api/v1/profiles` routes |
-
-## Implementation notes
-- **YARP version**: 2.2.0. Reads routes via the standard `LoadFromConfig` extension
-  pointing at the `ReverseProxy` section.
-- **JWT validation**: standard `Microsoft.AspNetCore.Authentication.JwtBearer` with
-  HS256 (symmetric). For Auth0-issued tokens (RS256 with JWKS), this can be extended
-  in a follow-up.
-- **Discovery**: thin custom HTTP client against Consul agent API. We chose this
-  over `Microsoft.Extensions.ServiceDiscovery` for now because we need explicit
-  control over service registration lifecycle and tags. Future iterations may
-  switch to the Microsoft package for load balancing across multiple instances.
-- **Logging**: Serilog to console with request logging enabled.
-
-## License
-For academic use - InCleanHome team.
+There's NO custom JWT middleware here — we use the standard `JwtBearer` from
+ASP.NET Core, configured in `Program.cs`. Each microservice has its own JWT
+validation too.
