@@ -72,4 +72,4 @@ src/InCleanHome.ApiGateway/
 
 There's NO custom JWT middleware here — we use the standard `JwtBearer` from
 ASP.NET Core, configured in `Program.cs`. Each microservice has its own JWT
-validation too.
+validation too (defense in depth).
